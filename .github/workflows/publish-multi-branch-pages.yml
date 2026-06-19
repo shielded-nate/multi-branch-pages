@@ -119,14 +119,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf "${{ inputs.render_output_dir }}"
+          output_dir="${{ inputs.render_output_dir }}"
+          if [[ -z "$output_dir" || "$output_dir" == "/" || "$output_dir" == "." ]]; then
+            echo "Unsafe render_output_dir: '$output_dir'" >&2
+            exit 1
+          fi
+          rm -rf "$output_dir"
           bash -euo pipefail -c "${{ inputs.render_command }}"
-          if [[ ! -d "${{ inputs.render_output_dir }}" ]]; then
-            echo "Expected render_output_dir '${{ inputs.render_output_dir }}' was not produced for branch '${{ matrix.branch }}'." >&2
+          if [[ ! -d "$output_dir" ]]; then
+            echo "Expected render_output_dir '$output_dir' was not produced for branch '${{ matrix.branch }}'." >&2
             exit 1
           fi
           mkdir -p "${{ steps.meta.outputs.cache_path }}"
-          cp -a "${{ inputs.render_output_dir }}/." "${{ steps.meta.outputs.cache_path }}/"
+          cp -a "$output_dir/." "${{ steps.meta.outputs.cache_path }}/"
 
       - name: Save branch render cache
         if: steps.restore-cache.outputs.cache-hit != 'true'
