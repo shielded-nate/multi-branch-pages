@@ -1,0 +1,238 @@
+name: Publish Multi-Branch Pages
+
+on:
+  workflow_call:
+    inputs:
+      branch_whitelist:
+        description: "'*' for all branches, or comma/newline/space-separated branch names"
+        required: false
+        type: string
+        default: "*"
+      render_command:
+        description: "Command to render docs in each branch"
+        required: true
+        type: string
+      render_output_dir:
+        description: "Directory (relative to repo root) containing rendered static output"
+        required: true
+        type: string
+    secrets: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      branches_json: ${{ steps.discover.outputs.branches_json }}
+      branches_for_index_json: ${{ steps.discover.outputs.branches_for_index_json }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: discover
+        name: Discover branch list
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin "+refs/heads/*:refs/remotes/origin/*"
+
+          mapfile -t all_branches < <(
+            git for-each-ref --format='%(refname:short)' refs/remotes/origin \
+              | sed 's#^origin/##' \
+              | grep -v '^HEAD$' \
+              | sort -u
+          )
+
+          whitelist="${{ inputs.branch_whitelist }}"
+          if [[ "$whitelist" == "*" ]]; then
+            selected=("${all_branches[@]}")
+          else
+            normalized="$(printf '%s' "$whitelist" | tr ',\n' ' ')"
+            read -r -a requested <<< "$normalized"
+            selected=()
+            for candidate in "${requested[@]}"; do
+              [[ -z "$candidate" ]] && continue
+              for b in "${all_branches[@]}"; do
+                if [[ "$b" == "$candidate" ]]; then
+                  selected+=("$candidate")
+                  break
+                fi
+              done
+            done
+          fi
+
+          if [[ ${#selected[@]} -eq 0 ]]; then
+            echo "No branches selected from whitelist: '$whitelist'" >&2
+            exit 1
+          fi
+
+          branches_json="$(
+            printf '%s\n' "${selected[@]}" | python -c 'import json,sys; print(json.dumps([x.strip() for x in sys.stdin.read().splitlines() if x.strip()]))'
+          )"
+
+          echo "branches_json=$branches_json" >> "$GITHUB_OUTPUT"
+          echo "branches_for_index_json=$branches_json" >> "$GITHUB_OUTPUT"
+          echo "Selected branches: $branches_json"
+
+  render:
+    runs-on: ubuntu-latest
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.discover.outputs.branches_json) }}
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 1
+
+      - id: meta
+        name: Compute metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          slug="$(printf '%s' "${{ matrix.branch }}" | tr '/:@ ' '----')"
+          cache_path="$RUNNER_TEMP/multi-branch-pages-cache/$slug"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "cache_path=$cache_path" >> "$GITHUB_OUTPUT"
+
+      - id: restore-cache
+        name: Restore branch render cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.meta.outputs.cache_path }}
+          key: mbp-${{ github.repository }}-${{ matrix.branch }}-${{ steps.meta.outputs.head_sha }}
+
+      - name: Render branch output
+        if: steps.restore-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir="${{ inputs.render_output_dir }}"
+          if [[ -z "$output_dir" || "$output_dir" == "/" || "$output_dir" == "." ]]; then
+            echo "Unsafe render_output_dir: '$output_dir'" >&2
+            exit 1
+          fi
+          rm -rf "$output_dir"
+          bash -euo pipefail -c "${{ inputs.render_command }}"
+          if [[ ! -d "$output_dir" ]]; then
+            echo "Expected render_output_dir '$output_dir' was not produced for branch '${{ matrix.branch }}'." >&2
+            exit 1
+          fi
+          mkdir -p "${{ steps.meta.outputs.cache_path }}"
+          cp -a "$output_dir/." "${{ steps.meta.outputs.cache_path }}/"
+
+      - name: Save branch render cache
+        if: steps.restore-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.meta.outputs.cache_path }}
+          key: mbp-${{ github.repository }}-${{ matrix.branch }}-${{ steps.meta.outputs.head_sha }}
+
+      - name: Package branch artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/package-${{ steps.meta.outputs.slug }}"
+          mkdir -p "$package_dir/content"
+          cp -a "${{ steps.meta.outputs.cache_path }}/." "$package_dir/content/"
+          printf '%s' "${{ matrix.branch }}" > "$package_dir/branch.txt"
+
+      - name: Upload branch artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: branch-${{ steps.meta.outputs.slug }}
+          path: ${{ runner.temp }}/package-${{ steps.meta.outputs.slug }}
+          if-no-files-found: error
+
+  assemble:
+    runs-on: ubuntu-latest
+    needs:
+      - discover
+      - render
+    steps:
+      - name: Download branch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: branch-*
+          path: ${{ runner.temp }}/branches
+
+      - name: Assemble static site
+        shell: bash
+        env:
+          BRANCHES_JSON: ${{ needs.discover.outputs.branches_for_index_json }}
+        run: |
+          set -euo pipefail
+
+          site_dir="$RUNNER_TEMP/site"
+          rm -rf "$site_dir"
+          mkdir -p "$site_dir"
+
+          shopt -s nullglob
+          for artifact in "$RUNNER_TEMP"/branches/*; do
+            [[ -d "$artifact" ]] || continue
+            branch="$(cat "$artifact/branch.txt")"
+            target_dir="$site_dir/$branch"
+            mkdir -p "$target_dir"
+            cp -a "$artifact/content/." "$target_dir/"
+          done
+
+          python - <<'PY'
+          import html
+          import json
+          import os
+          import urllib.parse
+
+          site_dir = os.environ["RUNNER_TEMP"] + "/site"
+          branches = json.loads(os.environ["BRANCHES_JSON"])
+          links = []
+          for branch in branches:
+            href = urllib.parse.quote(branch, safe="/") + "/"
+            links.append(f'<li><a href="{href}">{html.escape(branch)}</a></li>')
+          body = "\n".join(links)
+          index = (
+              "<!doctype html>\n"
+              "<html lang=\"en\">\n"
+              "  <head>\n"
+              "    <meta charset=\"utf-8\" />\n"
+              "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n"
+              "    <title>Branch Docs Index</title>\n"
+              "  </head>\n"
+              "  <body>\n"
+              "    <h1>Branch Docs Index</h1>\n"
+              "    <ul>\n"
+              f"      {body}\n"
+              "    </ul>\n"
+              "  </body>\n"
+              "</html>\n"
+          )
+          with open(os.path.join(site_dir, "index.html"), "w", encoding="utf-8") as f:
+            f.write(index)
+          PY
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: assemble
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
