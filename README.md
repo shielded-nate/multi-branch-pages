@@ -84,4 +84,6 @@ Each branch must support a common render command (`render_command`) that produce
 - Removed branches:
   - Not included in newly assembled site output, so they disappear from published Pages content
 - Index generation:
-  - Creates root `index.html` linking to each rendered branch path
+  - Creates root `index.html` with:
+    - rendered branch links to `/<branch>/`
+    - non-rendering branch links to each branch's GitHub code page
