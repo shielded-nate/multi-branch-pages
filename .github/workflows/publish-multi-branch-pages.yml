@@ -114,8 +114,10 @@ jobs:
           path: ${{ steps.meta.outputs.cache_path }}
           key: mbp-${{ github.repository }}-${{ matrix.branch }}-${{ steps.meta.outputs.head_sha }}
 
-      - name: Render branch output
+      - id: render
+        name: Render branch output
         if: steps.restore-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -134,22 +136,40 @@ jobs:
           cp -a "$output_dir/." "${{ steps.meta.outputs.cache_path }}/"
 
       - name: Save branch render cache
-        if: steps.restore-cache.outputs.cache-hit != 'true'
+        if: steps.restore-cache.outputs.cache-hit != 'true' && steps.render.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.meta.outputs.cache_path }}
           key: mbp-${{ github.repository }}-${{ matrix.branch }}-${{ steps.meta.outputs.head_sha }}
 
+      - id: branch-status
+        name: Determine branch render status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cache_path="${{ steps.meta.outputs.cache_path }}"
+          status="non-rendering"
+          if [[ -d "$cache_path" ]] && find "$cache_path" -mindepth 1 -print -quit | grep -q .; then
+            status="rendered"
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
       - name: Package branch artifact
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
           package_dir="$RUNNER_TEMP/package-${{ steps.meta.outputs.slug }}"
           mkdir -p "$package_dir/content"
-          cp -a "${{ steps.meta.outputs.cache_path }}/." "$package_dir/content/"
           printf '%s' "${{ matrix.branch }}" > "$package_dir/branch.txt"
+          printf '%s' "${{ steps.branch-status.outputs.status }}" > "$package_dir/status.txt"
+          if [[ "${{ steps.branch-status.outputs.status }}" == "rendered" ]]; then
+            cp -a "${{ steps.meta.outputs.cache_path }}/." "$package_dir/content/"
+          fi
 
       - name: Upload branch artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: branch-${{ steps.meta.outputs.slug }}
@@ -170,8 +190,6 @@ jobs:
 
       - name: Assemble static site
         shell: bash
-        env:
-          BRANCHES_JSON: ${{ needs.discover.outputs.branches_for_index_json }}
         run: |
           set -euo pipefail
 
@@ -183,6 +201,8 @@ jobs:
           for artifact in "$RUNNER_TEMP"/branches/*; do
             [[ -d "$artifact" ]] || continue
             branch="$(cat "$artifact/branch.txt")"
+            status="$(cat "$artifact/status.txt")"
+            [[ "$status" == "rendered" ]] || continue
             target_dir="$site_dir/$branch"
             mkdir -p "$target_dir"
             cp -a "$artifact/content/." "$target_dir/"
@@ -190,17 +210,48 @@ jobs:
 
           python - <<'PY'
           import html
-          import json
           import os
           import urllib.parse
 
           site_dir = os.environ["RUNNER_TEMP"] + "/site"
-          branches = json.loads(os.environ["BRANCHES_JSON"])
-          links = []
-          for branch in branches:
-            href = urllib.parse.quote(branch, safe="/") + "/"
-            links.append(f'<li><a href="{href}">{html.escape(branch)}</a></li>')
-          body = "\n".join(links)
+          artifacts_dir = os.environ["RUNNER_TEMP"] + "/branches"
+          github_repository = os.environ["GITHUB_REPOSITORY"]
+
+          rendered_links = []
+          non_rendering_links = []
+
+          if os.path.isdir(artifacts_dir):
+            for artifact_name in sorted(os.listdir(artifacts_dir)):
+              artifact_path = os.path.join(artifacts_dir, artifact_name)
+              if not os.path.isdir(artifact_path):
+                continue
+              branch_path = os.path.join(artifact_path, "branch.txt")
+              status_path = os.path.join(artifact_path, "status.txt")
+              if not os.path.exists(branch_path) or not os.path.exists(status_path):
+                continue
+              with open(branch_path, encoding="utf-8") as f:
+                branch = f.read().strip()
+              with open(status_path, encoding="utf-8") as f:
+                status = f.read().strip()
+              if not branch:
+                continue
+              if status == "rendered":
+                href = urllib.parse.quote(branch, safe="/") + "/"
+                rendered_links.append(f'<li><a href="{href}">{html.escape(branch)}</a></li>')
+              else:
+                href = "https://github.com/{repo}/tree/{branch}".format(
+                    repo=github_repository,
+                    branch=urllib.parse.quote(branch, safe="")
+                )
+                non_rendering_links.append(f'<li><a href="{href}">{html.escape(branch)}</a></li>')
+
+          if not rendered_links:
+            rendered_links.append("<li><em>None</em></li>")
+          if not non_rendering_links:
+            non_rendering_links.append("<li><em>None</em></li>")
+
+          rendered_body = "\n".join(rendered_links)
+          non_rendering_body = "\n".join(non_rendering_links)
           index = (
               "<!doctype html>\n"
               "<html lang=\"en\">\n"
@@ -211,8 +262,13 @@ jobs:
               "  </head>\n"
               "  <body>\n"
               "    <h1>Branch Docs Index</h1>\n"
+              "    <h2>Rendered branches</h2>\n"
               "    <ul>\n"
-              f"      {body}\n"
+              f"      {rendered_body}\n"
+              "    </ul>\n"
+              "    <h2>Non-rendering branches</h2>\n"
+              "    <ul>\n"
+              f"      {non_rendering_body}\n"
               "    </ul>\n"
               "  </body>\n"
               "</html>\n"
